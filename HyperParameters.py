@@ -22,13 +22,13 @@ biased_data_sizes = [5500, 500, 500, 500, 500, 500, 500, 500, 500, 500]
 adversarial_loss_weight = 1.0
 classification_loss_weight = 0.1
 
-is_acgan = False
+is_acgan = False # if false, it's CAGAN
 use_gcls = False
 DiscriminatorNormLayer = tfa.layers.InstanceNormalization
 #DiscriminatorNormLayer = kr.layers.BatchNormalization
 biased_train_data = True
 mixed_batch_training = False
-ratio_per_epoch = 0.01
+ratio_per_epoch = 0.01 # When mixed_batch_training=True, the ratio of real batch and fake batch changes by this value for every epoch.
 
 
 load_model = False
