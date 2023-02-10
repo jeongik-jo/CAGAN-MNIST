@@ -1,82 +1,114 @@
 import tensorflow as tf
-import tensorflow.keras as kr
-import Data
-import HyperParameters as HP
+from tensorflow import keras as kr
+import HyperParameters as hp
 
 
 @tf.function
 def _train(generator: kr.Model, discriminator: kr.Model, data: tf.Tensor, epoch):
     with tf.GradientTape(persistent=True) as tape:
         real_images = data['images']
-        real_labels = tf.one_hot(data['labels'], HP.class_size)
+        real_labels = tf.one_hot(data['labels'], depth=hp.label_dim)
 
         batch_size = real_images.shape[0]
+        latent_vectors = hp.latent_dist_func(batch_size)
+        fake_labels = tf.one_hot(tf.random.uniform([batch_size], minval=0, maxval=hp.label_dim, dtype='int32'), depth=hp.label_dim)
 
-        latent_vectors = tf.random.normal([batch_size, HP.latent_vector_dim])
-        condition_vectors = Data.make_random_condition_vectors(batch_size)
+        fake_images = generator([fake_labels, latent_vectors])
 
-        fake_images = generator([condition_vectors, latent_vectors], training=True)
+        slice_index = tf.cast(tf.minimum(hp.mix_rate_per_epoch * epoch, 0.5) * batch_size, dtype='int32')
+        real_images0, real_images1 = real_images[:slice_index], real_images[slice_index:]
+        real_labels0, real_labels1 = real_labels[:slice_index], real_labels[slice_index:]
+        fake_images0, fake_images1 = fake_images[:slice_index], fake_images[slice_index:]
+        fake_labels0, fake_labels1 = fake_labels[:slice_index], fake_labels[slice_index:]
+        images0 = tf.concat([real_images0, fake_images1], axis=0)
+        labels0 = tf.concat([real_labels0, fake_labels1], axis=0)
+        images1 = tf.concat([fake_images0, real_images1], axis=0)
+        labels1 = tf.concat([fake_labels0, real_labels1], axis=0)
 
-        if HP.mixed_batch_training:
-            slice_index = tf.cast(tf.minimum(HP.ratio_per_epoch * epoch, 0.5) * batch_size, dtype='int32')
+        with tf.GradientTape(persistent=True) as reg_tape:
+            reg_tape.watch([images0, images1])
+            adv_values0, label_logits0 = discriminator(images0)
+            adv_values1, label_logits1 = discriminator(images1)
+            if hp.is_acgan:
+                reg_scores0 = adv_values0
+                reg_scores1 = adv_values1
+            else:
+                reg_scores0 = tf.reduce_sum(label_logits0 * labels0, axis=-1)
+                reg_scores1 = tf.reduce_sum(label_logits1 * labels1, axis=-1)
+        reg_losses = tf.reduce_sum(tf.square(reg_tape.gradient(reg_scores0, images0)), axis=[1, 2, 3]) + \
+                     tf.reduce_sum(tf.square(reg_tape.gradient(reg_scores1, images1)), axis=[1, 2, 3])
 
-            real_images0, real_images1 = real_images[:slice_index], real_images[slice_index:]
-            fake_images0, fake_images1 = fake_images[:slice_index], fake_images[slice_index:]
-            adversarial_values0, classification_values0 = discriminator(tf.concat([real_images0, fake_images1], axis=0),
-                                                                        training=True)
-            adversarial_values1, classification_values1 = discriminator(tf.concat([fake_images0, real_images1], axis=0),
-                                                                        training=True)
+        if hp.is_acgan:
+            real_adv_values = tf.concat([adv_values0[:slice_index], adv_values1[slice_index:]], axis=0)
+            fake_adv_values = tf.concat([adv_values1[:slice_index], adv_values0[slice_index:]], axis=0)
+            real_label_logits = tf.concat([label_logits0[:slice_index], label_logits1[slice_index:]], axis=0)
+            fake_label_logits = tf.concat([label_logits1[:slice_index], label_logits0[slice_index:]], axis=0)
+            dis_adv_losses = tf.nn.softplus(-real_adv_values) + tf.nn.softplus(fake_adv_values)
+            gen_adv_losses = tf.nn.softplus(-fake_adv_values)
 
-            real_adversarial_values = tf.concat([adversarial_values0[:slice_index],
-                                                 adversarial_values1[slice_index:]], axis=0)
-            fake_adversarial_values = tf.concat([adversarial_values1[:slice_index],
-                                                 adversarial_values0[slice_index:]], axis=0)
+            real_ce_losses = tf.losses.categorical_crossentropy(real_labels, real_label_logits, from_logits=True)
+            fake_ce_losses = tf.losses.categorical_crossentropy(fake_labels, fake_label_logits, from_logits=True)
 
-            real_classification_values = tf.concat([classification_values0[:slice_index],
-                                                    classification_values1[slice_index:]], axis=0)
-            fake_classification_values = tf.concat([classification_values1[:slice_index],
-                                                    classification_values0[slice_index:]], axis=0)
-        else:
-            real_adversarial_values, real_classification_values = discriminator(real_images, training=True)
-            fake_adversarial_values, fake_classification_values = discriminator(fake_images, training=True)
-
-        if HP.is_acgan:
-            real_classification_logits = tf.nn.softmax(real_classification_values)
-            fake_classification_logits = tf.nn.softmax(fake_classification_values)
-
-            discriminator_adversarial_losses = (real_adversarial_values - 1) ** 2 + fake_adversarial_values ** 2
-            generator_adversarial_losses = (fake_adversarial_values - 1) ** 2
-            discriminator_classification_losses = tf.expand_dims(tf.losses.categorical_crossentropy(real_labels, real_classification_logits), axis=1)
-            generator_classification_losses = tf.expand_dims(tf.losses.categorical_crossentropy(condition_vectors, fake_classification_logits), axis=1)
-
-            discriminator_losses = HP.adversarial_loss_weight * discriminator_adversarial_losses \
-                                   + HP.classification_loss_weight * discriminator_classification_losses
-            if HP.use_gcls:
-                discriminator_losses += HP.classification_loss_weight * generator_classification_losses
-
-            generator_losses = HP.adversarial_loss_weight * generator_adversarial_losses \
-                               + HP.classification_loss_weight * generator_classification_losses
+            dis_losses = dis_adv_losses + hp.ce_weight * real_ce_losses + hp.reg_weight * reg_losses
+            if hp.dis_fake_ce_loss:
+                dis_losses += hp.dis_fake_ce_weight * fake_ce_losses
+            gen_losses = gen_adv_losses + hp.ce_weight * fake_ce_losses
 
         else:
-            discriminator_losses = tf.reduce_sum(((real_classification_values - 1) ** 2) * real_labels
-                                                  + (fake_classification_values ** 2) * condition_vectors, axis=1, keepdims=True)
-            generator_losses = tf.reduce_sum(((fake_classification_values - 1) ** 2) * condition_vectors, axis=1, keepdims=True)
+            adv_values0 = tf.reduce_sum(label_logits0 * labels0, axis=-1)
+            adv_values1 = tf.reduce_sum(label_logits1 * labels1, axis=-1)
+            real_adv_values = tf.concat([adv_values0[:slice_index], adv_values1[slice_index:]], axis=0)
+            fake_adv_values = tf.concat([adv_values1[:slice_index], adv_values0[slice_index:]], axis=0)
+            dis_adv_losses = tf.nn.softplus(-real_adv_values) + tf.nn.softplus(fake_adv_values)
+            gen_adv_losses = tf.nn.softplus(-fake_adv_values)
 
-    HP.discriminator_optimizer.apply_gradients(
-        zip(tape.gradient(discriminator_losses, discriminator.trainable_variables),
+            dis_losses = dis_adv_losses + hp.reg_weight * reg_losses
+            gen_losses = gen_adv_losses
+
+        dis_loss = tf.reduce_mean(dis_losses)
+        gen_loss = tf.reduce_mean(gen_losses)
+
+    hp.dis_opt.apply_gradients(
+        zip(tape.gradient(dis_loss, discriminator.trainable_variables),
             discriminator.trainable_variables)
     )
 
-    HP.generator_optimizer.apply_gradients(
-        zip(tape.gradient(generator_losses, generator.trainable_variables),
+    hp.gen_opt.apply_gradients(
+        zip(tape.gradient(gen_loss, generator.trainable_variables),
             generator.trainable_variables)
     )
 
-    del tape
+    hp.gen_ema.apply(generator.trainable_variables)
+
+    results = {
+        'real_adv_values': real_adv_values, 'fake_adv_values': fake_adv_values,
+        'reg_losses': reg_losses
+    }
+    if hp.is_acgan:
+        results['real_ce_losses'] = real_ce_losses
+        results['fake_ce_losses'] = fake_ce_losses
+
+    return results
 
 
-def train(generator: kr.Model, discriminator: kr.Model, data: tf.data.Dataset, epoch):
-    data = data.shuffle(10000).batch(HP.batch_size).prefetch(1)
+def train(generator: kr.Model, discriminator: kr.Model, dataset: tf.data.Dataset, epoch):
+    results = {}
+    for data in dataset:
+        batch_results = _train(generator, discriminator, data, epoch)
+        for key in batch_results:
+            try:
+                results[key].append(batch_results[key])
+            except KeyError:
+                results[key] = [batch_results[key]]
 
-    for batch in data:
-        _train(generator, discriminator, batch, epoch)
+    temp_results = {}
+    for key in results:
+        mean, variance = tf.nn.moments(tf.concat(results[key], axis=0), axes=0)
+        temp_results[key + '_mean'] = mean
+        temp_results[key + '_variance'] = variance
+    results = temp_results
+
+    for key in results:
+        print('%-30s:' % key, '%13.6f' % results[key].numpy())
+
+    return results

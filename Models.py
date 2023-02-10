@@ -1,76 +1,66 @@
 import tensorflow as tf
-import tensorflow.keras as kr
-import tensorflow.keras.preprocessing.image as image
+from tensorflow import keras as kr
+from tensorflow.keras.preprocessing import image
 import Layers
 import os
-import HyperParameters as HP
+import HyperParameters as hp
 import numpy as np
-import tensorflow_addons as tfa
 
 
 class Generator(object):
+    def build_model(self):
+        label = kr.Input([hp.label_dim])
+        latent_vector = kr.Input([hp.latent_vector_dim])
+        return kr.Model([label, latent_vector], Layers.Generator()([label, latent_vector]))
+
     def __init__(self):
-        latent_vector = kr.Input([HP.latent_vector_dim])
-        condition_vector = kr.Input([HP.class_size])
-
-        input_vector = tf.concat([condition_vector, latent_vector], axis=-1)
-
-        model_output = kr.layers.Dense(units=tf.reduce_prod(HP.generator_initial_conv_shape),
-                                       activation=tf.nn.leaky_relu, use_bias=False)(input_vector)
-        model_output = kr.layers.Reshape(target_shape=HP.generator_initial_conv_shape)(model_output)
-        model_output = tfa.layers.InstanceNormalization()(model_output)
-
-        for _ in range(2):
-            model_output = Layers.DoubleResolution(conv_depth=3)(model_output)
-
-        model_output = Layers.ToGrayscale()(model_output)
-        self.model = kr.Model([condition_vector, latent_vector], model_output)
+        self.model = self.build_model()
+        self.save_latent_vectors = hp.latent_dist_func(hp.save_image_size)
 
     def save_images(self, epoch):
-        if not os.path.exists(HP.folder_name + '/images'):
-            os.makedirs(HP.folder_name + '/images')
+        if not os.path.exists('results/images'):
+            os.makedirs('results/images')
 
         images = []
-        for _ in range(HP.save_image_size):
-            latent_vector = tf.random.normal([1, HP.latent_vector_dim])
-            latent_vectors = tf.concat([latent_vector for _ in range(HP.class_size)], axis=0)
-            condition_vectors = tf.one_hot([i for i in range(HP.class_size)], HP.class_size)
+        for label in range(hp.label_dim):
+            label_vectors = tf.one_hot(tf.repeat(label, hp.save_image_size), depth=hp.label_dim)
+            fake_images = tf.clip_by_value(self.model([label_vectors, self.save_latent_vectors]),
+                                           clip_value_min=-1, clip_value_max=1)
+            images.append(np.vstack(fake_images))
 
-            fake_images = self.model([condition_vectors, latent_vectors])
-            images.append(np.hstack(fake_images))
-        image.save_img(path=HP.folder_name + '/images/fake %d.png' % epoch, x=np.vstack(images))
+        image.save_img(path='results/images/fake_%d.png' % epoch, x=np.hstack(images))
 
     def save(self):
-        if not os.path.exists('./models'):
+        if not os.path.exists('models'):
             os.makedirs('models')
-
-        self.model.save_weights('./models/generator.h5')
+        self.model.save_weights('models/generator.h5')
 
     def load(self):
-        self.model.load_weights('./models/generator.h5')
+        self.model.load_weights('models/generator.h5')
+
+    def to_ema(self):
+        self.train_weights = [tf.constant(weight) for weight in self.model.trainable_variables]
+        for weight in self.model.trainable_variables:
+            weight.assign(hp.gen_ema.average(weight))
+
+    def to_train(self):
+        for ema_weight, train_weight in zip(self.model.trainable_variables, self.train_weights):
+            ema_weight.assign(train_weight)
 
 
 class Discriminator(object):
+    def build_model(self):
+        input_image = kr.Input([hp.image_resolution, hp.image_resolution, 1])
+        return kr.Model(input_image, Layers.Discriminator()(input_image))
+
     def __init__(self):
-        model_output = input_image = kr.Input(shape=HP.image_shape)
-        model_output = kr.layers.Conv2D(filters=HP.discriminator_initial_filter_size, kernel_size=[3, 3],
-                                        padding='same', activation=tf.nn.leaky_relu, use_bias=False)(model_output)
-        model_output = HP.DiscriminatorNormLayer()(model_output)
-
-        for _ in range(2):
-            model_output = Layers.HalfResolution(conv_depth=3)(model_output)
-
-        model_output = kr.layers.Flatten()(model_output)
-        output_adversarial_logits = kr.layers.Dense(units=1, activation='linear')(model_output)
-        output_classification_logits = kr.layers.Dense(units=HP.class_size, activation='linear')(model_output)
-
-        self.model = kr.Model(input_image, [output_adversarial_logits, output_classification_logits])
+        self.model = self.build_model()
 
     def save(self):
-        if not os.path.exists('./models'):
+        if not os.path.exists('models'):
             os.makedirs('models')
 
-        self.model.save_weights('./models/discriminator.h5')
+        self.model.save_weights('models/discriminator.h5')
 
     def load(self):
-        self.model.load_weights('./models/discriminator.h5')
+        self.model.load_weights('models/discriminator.h5')

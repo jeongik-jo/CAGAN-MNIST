@@ -1,54 +1,67 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
 import time
-import HyperParameters as HP
+import HyperParameters as hp
 import Models
-import Data
+import Dataset
 import Train
 import Evaluate
 import os
+import numpy as np
+import matplotlib.pyplot as plt
 
 
 def main():
     generator = Models.Generator()
     discriminator = Models.Discriminator()
 
-    if HP.load_model:
+    if hp.load_model:
         generator.load()
         discriminator.load()
 
-    train_dataset, test_dataset = Data.load_dataset()
-    test_dataset = Data.separate_dataset(test_dataset)
+    train_dataset, test_datasets = Dataset.load_dataset()
 
-    if HP.biased_train_data:
-        train_dataset = Data.load_train_biased_data(HP.biased_data_sizes)
-
-    fids = []
-    for epoch in range(HP.epochs):
-        print('iter', epoch)
+    results = {}
+    for epoch in range(hp.epochs):
+        print('epoch', epoch)
         start = time.time()
-        Train.train(generator.model, discriminator.model, train_dataset, epoch)
+        train_results = Train.train(generator.model, discriminator.model, train_dataset, epoch)
         print('saving...')
         generator.save()
         discriminator.save()
+
+        generator.to_ema()
         generator.save_images(epoch)
         print('saved')
-        if HP.evaluate_model and (epoch + 1) % HP.epoch_per_evaluate == 0:
-            fid = Evaluate.get_multi_fid(generator.model, test_dataset)
-            print('fid :', fid)
-            fids.append(fid)
-        print('time: ', time.time() - start)
+        print('time: ', time.time() - start, '\n')
 
-    if not HP.evaluate_model:
-        fid = Evaluate.get_multi_fid(generator.model, test_dataset)
-        print('fid :', fid)
-        fids.append(fid)
+        if hp.evaluate_model and (epoch + 1) % hp.epoch_per_evaluate == 0:
+            print('evaluating...')
+            start = time.time()
+            evaluate_results = Evaluate.evaluate(generator.model, test_datasets)
+            for key in train_results:
+                try:
+                    results[key].append(train_results[key])
+                except KeyError:
+                    results[key] = [train_results[key]]
+            for key in evaluate_results:
+                try:
+                    results[key].append(evaluate_results[key])
+                except KeyError:
+                    results[key] = [evaluate_results[key]]
 
-    if not os.path.exists(HP.folder_name):
-        os.makedirs(HP.folder_name)
+            print('evaluated')
+            print('time: ', time.time() - start, '\n')
+            if not os.path.exists('results/figures'):
+                os.makedirs('results/figures')
+            for key in results:
+                np.savetxt('results/figures/%s.txt' % key, results[key], fmt='%f')
+                plt.title(key)
+                plt.xlabel('Epochs')
+                plt.ylabel(key)
+                plt.plot([(i + 1) * hp.epoch_per_evaluate for i in range(len(results[key]))], results[key])
+                plt.savefig('results/figures/%s.png' % key)
+                plt.clf()
 
-    Data.save_graph(fids)
+        generator.to_train()
 
 
 main()

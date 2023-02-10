@@ -1,50 +1,28 @@
-import tensorflow.keras as kr
+from tensorflow import keras as kr
 import tensorflow as tf
+import HyperParameters as hp
 import tensorflow_probability as tfp
-import HyperParameters as HP
 from scipy.linalg import sqrtm
 import numpy as np
 
+inception_model = kr.applications.InceptionV3(weights='imagenet', pooling='avg', include_top=False)
+
 
 @tf.function
-def _get_feature_samples(generator: kr.Model, condition, real_images: tf.Tensor):
+def _get_features(generator: kr.Model, real_images, label):
     batch_size = real_images.shape[0]
-    latent_vectors = tf.random.normal([batch_size, HP.latent_vector_dim])
-    condition_vectors = tf.one_hot(tf.fill([batch_size], condition), HP.class_size)
-    fake_images = generator([condition_vectors, latent_vectors])
+    fake_images = generator([tf.one_hot(tf.repeat(label, batch_size), depth=hp.label_dim),
+                             hp.latent_dist_func(batch_size)])
 
-    real_images = tf.concat([real_images for _ in range(3)], axis=-1)
-    real_images = tf.image.resize(real_images, [299, 299])
-    fake_images = tf.concat([fake_images for _ in range(3)], axis=-1)
-    fake_images = tf.image.resize(fake_images, [299, 299])
-
-    real_features = HP.inception_model(real_images)
-    fake_features = HP.inception_model(fake_images)
+    real_features = inception_model(tf.image.resize(
+        tf.tile(tf.clip_by_value(real_images, clip_value_min=-1, clip_value_max=1), [1, 1, 1, 3]), [299, 299]))
+    fake_features = inception_model(tf.image.resize(
+        tf.tile(tf.clip_by_value(fake_images, clip_value_min=-1, clip_value_max=1), [1, 1, 1, 3]), [299, 299]))
 
     return real_features, fake_features
 
 
-def get_features(generator: kr.Model, condition, real_image_dataset: tf.data.Dataset):
-    real_image_dataset = real_image_dataset.shuffle(10000).batch(HP.batch_size).prefetch(1)
-
-    real_features = []
-    fake_features = []
-
-    for real_images in real_image_dataset:
-        real_features_batch, fake_features_batch = _get_feature_samples(generator, condition, real_images)
-        real_features.append(real_features_batch)
-        fake_features.append(fake_features_batch)
-
-    real_features = tf.concat(real_features, axis=0)
-    fake_features = tf.concat(fake_features, axis=0)
-
-    return real_features, fake_features
-
-
-#@tf.function
-def get_fid(generator: kr.Model, condition, real_image_dataset: tf.data.Dataset):
-    real_features, fake_features = get_features(generator, condition, real_image_dataset)
-
+def _get_fid(real_features, fake_features):
     real_features_mean = tf.reduce_mean(real_features, axis=0)
     fake_features_mean = tf.reduce_mean(fake_features, axis=0)
 
@@ -62,9 +40,24 @@ def get_fid(generator: kr.Model, condition, real_image_dataset: tf.data.Dataset)
     return fid
 
 
-def get_multi_fid(generator: kr.Model, real_image_datasets):
-    fids = []
-    for condition, real_image_dataset in zip(range(HP.class_size), real_image_datasets):
-        fids.append(get_fid(generator, condition, real_image_dataset))
+def evaluate(generator: kr.Model, test_datasets):
+    real_features_sets = [[] for _ in range(hp.label_dim)]
+    fake_features_sets = [[] for _ in range(hp.label_dim)]
+    label_fids = []
+    for label, test_dataset in enumerate(test_datasets):
+        for real_images in test_dataset:
+            batch_real_features, batch_fake_features = _get_features(generator, real_images, label)
+            real_features_sets[label].append(batch_real_features)
+            fake_features_sets[label].append(batch_fake_features)
+        real_features_sets[label] = tf.concat(real_features_sets[label], axis=0)
+        fake_features_sets[label] = tf.concat(fake_features_sets[label], axis=0)
+        label_fids.append(_get_fid(real_features_sets[label], fake_features_sets[label]))
+    real_features = tf.concat(real_features_sets, axis=0)
+    fake_features = tf.concat(fake_features_sets, axis=0)
+    total_fid = _get_fid(real_features, fake_features)
 
-    return tf.reduce_mean(fids)
+    results = {'total_fid': total_fid, 'average_fid': np.mean(label_fids)}
+    for key in results:
+        print('%-20s:' % key, '%13.6f' % np.array(results[key]))
+
+    return results
